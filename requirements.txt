@@ -7,3 +7,5 @@ faster-whisper; sys_platform != "darwin" or platform_machine != "arm64"
 pillow-heif; sys_platform == "win32"
 Pillow
 janome
+# 参考リールのURL取得（reel-henshu-copy＝リール間コピー用。build_copy.pyが python -m yt_dlp で呼ぶ）
+yt-dlp

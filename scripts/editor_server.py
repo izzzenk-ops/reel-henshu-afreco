@@ -8,6 +8,7 @@ import concurrent.futures
 import json
 import mimetypes
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -252,6 +253,83 @@ def _get_preview_proxy(filename: str) -> Path:
     return proxy_path
 
 
+def _scene_scores(ref_path: Path) -> list:
+    """参考リール全体の各フレームのシーン変化スコア [(time, score), ...] を返す
+    （ffmpeg scdet。scoreは0〜100、ハードカットで大きく跳ねる）。"""
+    r = subprocess.run(
+        ["ffmpeg", "-nostdin", "-hide_banner", "-nostats", "-i", str(ref_path),
+         "-vf", "scdet=threshold=0,metadata=print", "-an", "-f", "null", "-"],
+        capture_output=True, text=True)
+    scores, last = [], None
+    for line in r.stderr.splitlines():
+        m = re.search(r"lavfi\.scd\.score=([\d.]+)", line)
+        if m:
+            last = float(m.group(1)); continue
+        m = re.search(r"lavfi\.scd\.time=([\d.]+)", line)
+        if m and last is not None:
+            scores.append((float(m.group(1)), last)); last = None
+    return scores
+
+
+def detect_splits(ref_path: Path, start: float, dur: float, n: int) -> list:
+    """参考リールの [start, start+dur] 区間を、実際のカット境界で n 個に分ける。
+    区間内のシーン変化スコアが強い順に n-1 個の境界を選び（均等割りにしない＝
+    元リールの不均等なカット尺を再現）、足りない分だけ一番広い隙間を等分して補う。
+    戻り値: [(ref_in, ref_dur), ...]（n個・合計=dur）。"""
+    end = start + dur
+    edge = min(0.12, dur * 0.12)      # 区間の端すぎる検出は境界にしない
+    min_gap = min(0.20, dur / (n * 2))  # 境界どうしが近すぎないように
+    cand = [(t, s) for (t, s) in _scene_scores(ref_path) if start + edge < t < end - edge]
+    cand.sort(key=lambda x: -x[1])  # スコア降順
+    picked = []
+    for t, _ in cand:
+        if len(picked) >= n - 1:
+            break
+        if all(abs(t - p) >= min_gap for p in picked):
+            picked.append(round(t, 3))
+    picked.sort()
+    bounds = [round(start, 3)] + picked + [round(end, 3)]
+    # 検出された境界が n-1 に満たない場合は、一番広い区間を半分に割って数を合わせる
+    while len(bounds) - 1 < n:
+        gi = max(range(len(bounds) - 1), key=lambda i: bounds[i + 1] - bounds[i])
+        mid = round((bounds[gi] + bounds[gi + 1]) / 2, 3)
+        bounds.insert(gi + 1, mid)
+    segs = [(round(bounds[i], 3), round(bounds[i + 1] - bounds[i], 3)) for i in range(n)]
+    return segs
+
+
+AUTO_SPLIT_SCORE = 1.0    # この強さ以上のシーン変化を「カットの切れ目」の候補とみなす（自動分割用）
+AUTO_SPLIT_MIN_SEG = 0.25  # 自動分割後の各カットの最短秒数。これ未満になる切れ目は採らない
+
+
+def detect_auto_splits(ref_path: Path, start: float, dur: float, max_cuts: int = 7) -> list:
+    """参考リールの [start, start+dur] 区間の中に実際に何カットあるかを自動判定し、
+    その数だけの ref区間 [(ref_in, ref_dur), ...] を返す（ユーザーが枚数を数えなくてよい）。
+
+    誤検出対策: scdetのスコアだけでは「本物のカット」と「1ショット内の速い動き」を
+    見分けられず、短いカードを刻みすぎる（実測: 0.53秒のカードが0.16秒刻みで3分割された）。
+    そこで自動分割は保守的にし、各カットが AUTO_SPLIT_MIN_SEG 秒以上になる切れ目だけ採用する
+    （区間の端からも・互いにも MIN_SEG 秒以上離す）。過剰分割よりは分割しない側に倒す
+    （足りなければ手動分割で足せる）。追加カットが無ければ1区間（=分割不要）を返す。"""
+    end = start + dur
+    mg = AUTO_SPLIT_MIN_SEG
+    if dur < 2 * mg:  # 区間が短すぎて2つに割れない
+        return [(round(start, 3), round(dur, 3))]
+    cand = [(t, s) for (t, s) in _scene_scores(ref_path)
+            if start + mg <= t <= end - mg and s >= AUTO_SPLIT_SCORE]
+    cand.sort(key=lambda x: -x[1])  # 強い順
+    picked = []
+    for t, _ in cand:
+        if len(picked) >= max_cuts:
+            break
+        if all(abs(t - p) >= mg for p in picked):  # 既存の切れ目ともMIN_SEG以上離す
+            picked.append(round(t, 3))
+    picked.sort()
+    bounds = [round(start, 3)] + picked + [round(end, 3)]
+    return [(round(bounds[i], 3), round(bounds[i + 1] - bounds[i], 3))
+            for i in range(len(bounds) - 1)]
+
+
 class Handler(BaseHTTPRequestHandler):
 
     def log_message(self, format, *args):
@@ -329,6 +407,67 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self._serve_range_file(final_path)
 
+        elif path == "/api/detect_splits":
+            # リール間コピーのカード分割用。参考リールの [start, start+dur] を、
+            # 実際のカット境界で n 個に分けた ref区間の一覧を返す（均等割りにしない）。
+            ref_path = work_dir / "reference.mp4"
+            n_raw = query.get("n", ["2"])[0]
+            auto = (n_raw == "auto")
+            try:
+                start = float(query.get("start", ["0"])[0])
+                dur = float(query.get("dur", ["0"])[0])
+                n = 0 if auto else int(n_raw)
+            except ValueError:
+                self.send_response(400); self.end_headers(); return
+            if not ref_path.exists() or dur <= 0 or (not auto and n < 2):
+                self._send_json({"ok": False, "segments": []})
+                return
+            try:
+                segs = detect_auto_splits(ref_path, start, dur) if auto \
+                    else detect_splits(ref_path, start, dur, n)
+                self._send_json({"ok": True,
+                                 "segments": [{"ref_in": s, "ref_dur": d} for s, d in segs]})
+            except Exception as e:
+                self._send_json({"ok": False, "error": str(e), "segments": []})
+
+        elif path == "/api/refvideo":
+            # リール間コピーの「お手本プレビュー」用。参考リール(reference.mp4)を
+            # Range対応で配信する（全体版。カード単位は /api/refclip）。
+            ref_path = work_dir / "reference.mp4"
+            if not ref_path.exists():
+                self.send_response(404)
+                self.end_headers()
+                return
+            self._serve_range_file(ref_path)
+
+        elif path == "/api/refclip":
+            # お手本プレビュー（カード単位）。参考リールから [in, in+dur] だけを切り出した
+            # 動画を配信する。フロントは <video loop> でネイティブにループ再生するので、
+            # 構造上そのカードのカット以外は絶対に映らない（次シーンにはみ出さない）。
+            ref_path = work_dir / "reference.mp4"
+            try:
+                rin = float(query.get("in", ["0"])[0])
+                rdur = float(query.get("dur", ["0"])[0])
+            except ValueError:
+                self.send_response(400); self.end_headers(); return
+            if not ref_path.exists() or rdur <= 0:
+                self.send_response(404); self.end_headers(); return
+            clips_dir = work_dir / "refclips"
+            clips_dir.mkdir(parents=True, exist_ok=True)
+            out = clips_dir / f"{rin:.3f}_{rdur:.3f}.mp4"
+            if not out.exists():
+                tmp = clips_dir / f".{rin:.3f}_{rdur:.3f}.part.mp4"
+                cmd = ["ffmpeg", "-nostdin", "-y", "-ss", f"{rin:.3f}", "-i", str(ref_path),
+                       "-t", f"{rdur:.3f}", "-vf", "scale=-2:960", *video_encoder(),
+                       "-c:a", "aac", "-b:a", "128k", str(tmp)]
+                try:
+                    subprocess.run(cmd, capture_output=True, check=True)
+                    os.replace(tmp, out)
+                except Exception:
+                    tmp.unlink(missing_ok=True)
+                    self.send_response(500); self.end_headers(); return
+            self._serve_range_file(out)
+
         elif path == "/api/sounds":
             sounds = []
             if SOUND_DIR.exists():
@@ -379,10 +518,13 @@ class Handler(BaseHTTPRequestHandler):
         data = json.loads(body) if body else {}
 
         if self.path == "/api/save":
+            # 既存のトップレベルキー（voiceover_path / copy_mode / reference_video 等）は
+            # 保持したまま cards だけ更新する。以前は {cards, voiceover_path} で丸ごと
+            # 上書きしていたため、リール間コピーの copy_mode/reference_video が
+            # 最初の自動保存で消えていた。
             existing = _load_json(work_dir / "timeline.json")
-            timeline = {"cards": data["cards"],
-                        "voiceover_path": existing.get("voiceover_path")}
-            _save_json(work_dir / "timeline.json", timeline)
+            existing["cards"] = data["cards"]
+            _save_json(work_dir / "timeline.json", existing)
             self._send_json({"ok": True})
 
         elif self.path == "/api/reassign":
@@ -468,6 +610,15 @@ class Handler(BaseHTTPRequestHandler):
 
         self._send_json({"ok": True, "clips": target["clips"]})
 
+    def _reference_video(self, timeline: dict):
+        """リール間コピー用の参考リール(reference.mp4)のパス。未割当てカードを
+        仮映像で埋めるために render_timeline に渡す。無ければ None（通常フロー）。"""
+        ref_name = timeline.get("reference_video")
+        if not ref_name:
+            return None
+        ref = work_dir / ref_name
+        return ref if ref.exists() else None
+
     def _handle_render(self, data: dict):
         timeline = _load_json(work_dir / "timeline.json")
         voiceover_path = timeline.get("voiceover_path")
@@ -475,7 +626,8 @@ class Handler(BaseHTTPRequestHandler):
 
         try:
             render_timeline(timeline["cards"], materials_dir, work_dir / "final.mp4",
-                             voiceover_path, jl_cut_offset)
+                             voiceover_path, jl_cut_offset,
+                             reference_video=self._reference_video(timeline))
             self._send_json({"ok": True, "output": str(work_dir / "final.mp4")})
         except Exception as e:
             self._send_json({"ok": False, "error": str(e)})
@@ -488,7 +640,8 @@ class Handler(BaseHTTPRequestHandler):
         jl_cut_offset = 0.2 if data.get("jl_cut") else 0.0
         try:
             render_timeline(timeline["cards"], materials_dir, work_dir / "final_export.mp4",
-                             voiceover_path, jl_cut_offset, hdr_fix=True)
+                             voiceover_path, jl_cut_offset, hdr_fix=True,
+                             reference_video=self._reference_video(timeline))
             self._send_json({"ok": True})
         except Exception as e:
             self._send_json({"ok": False, "error": str(e)})

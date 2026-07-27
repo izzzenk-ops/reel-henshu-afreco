@@ -544,9 +544,31 @@ def _cleanup_render_cache(work_dir: Path, used_fingerprints: set):
             f.unlink()
 
 
+def _fill_unassigned_with_reference(cards: list, reference_video: Path) -> list:
+    """リール間コピー用: 素材が未割当てのカードを、参考リールの該当区間の映像で
+    「仮埋め」する。これで素材を1つも入れていなくても完成版プレビューがフル尺で
+    作れる（初心者が『全部割り当てるまで一度も確認できない』で詰むのを防ぐ）。
+    自分の素材を割り当てたカードから順に本番映像へ置き換わる。
+    差し込む尺はカードのタイムライン上の長さ(end-start)に合わせる（秒数を編集
+    していても仮映像の長さがカード枠と一致する）。戻り値: 仮埋めしたカード番号(1始まり)。"""
+    ref = str(Path(reference_video).resolve())
+    filled = []
+    for idx, card in enumerate(cards):
+        if _get_clips(card):
+            continue
+        dur = round(float(card.get("end", 0)) - float(card.get("start", 0)), 3)
+        if dur <= 0:
+            dur = float(card.get("ref_dur") or 0.5)
+        ref_in = float(card.get("ref_in", card.get("start", 0.0)) or 0.0)
+        card["clips"] = [{"file": ref, "in": ref_in, "duration": dur, "_placeholder": True}]
+        filled.append(idx + 1)
+    return filled
+
+
 def render_timeline(cards: list, materials_dir: Path, output_path: Path,
                      voiceover_path: Path = None, jl_cut_offset: float = 0.0,
-                     telop_color: str = None, hdr_fix: bool = False):
+                     telop_color: str = None, hdr_fix: bool = False,
+                     reference_video: Path = None):
     """カード単位（ユニット）でキャッシュしながらレンダーする（先頭カードに
     "title"が設定されていればその区間にタイトルを重ねて表示する。詳細は
     captions.build_caption_segments参照）。変更されていない
@@ -561,6 +583,12 @@ def render_timeline(cards: list, materials_dir: Path, output_path: Path,
     global _HDR_FIX, _CACHE_SUBDIR
     _HDR_FIX = hdr_fix
     _CACHE_SUBDIR = "render_cache_export" if hdr_fix else "render_cache"
+
+    # リール間コピー: 参考リールがあれば、未割当てカードをその映像で仮埋めして
+    # フル尺のプレビューを作れるようにする（詰み防止）。参考リールが無い通常フローは
+    # 従来どおり「全部割り当ててから」に倒す。
+    if reference_video and Path(reference_video).exists():
+        _fill_unassigned_with_reference(cards, reference_video)
 
     # 未割当てカードのチェック（スキップして書き出すと映像が短くなり
     # 音声・テロップとズレた動画がサイレントに生成されてしまうため、先に止める）

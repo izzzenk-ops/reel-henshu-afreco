@@ -272,6 +272,7 @@
     line-height: 1.5;
   }
   .card-text:focus { outline: none; border-color: var(--accent); }
+  .card-text::placeholder { color: #C0C0C0; font-style: italic; }  /* テロップ見本: 薄いグレー・修正前提 */
   .card-text-row { display: flex; gap: 14px; align-items: flex-start; margin-top: 8px; }
   .card-text-row .card-text { flex: 0 0 38%; width: auto; margin: 0; }
   .header-controls { display: flex; align-items: center; gap: 14px; margin-left: auto; flex-wrap: wrap; row-gap: 6px; }
@@ -469,6 +470,24 @@
   }
   .undo-toast.hidden { display: none; }
   .undo-toast button { padding: 6px 12px; }
+  /* リール間コピー: カード秒数の数字入力・お手本ボタン */
+  .dur-edit { display: inline-flex; align-items: center; gap: 4px; font-size: 13px; color: var(--text-muted); }
+  .dur-input { width: 56px; font-size: 13px; padding: 3px 6px; text-align: right;
+    border: 1px solid var(--border); border-radius: var(--radius-sm); }
+  .dur-input:focus { outline: none; border-color: var(--accent); }
+  .btn-ref { font-size: 12px; padding: 4px 10px; border-radius: var(--radius-sm);
+    border: 1px solid var(--border); background: #F3F7FF; color: #3A6FB0; cursor: pointer; }
+  .btn-ref:hover { filter: brightness(0.97); }
+  .split-ctrl { display: inline-flex; align-items: center; gap: 3px; font-size: 12px; color: var(--text-muted); }
+  .split-n { width: 40px; font-size: 12px; padding: 3px 4px; text-align: right;
+    border: 1px solid var(--border); border-radius: var(--radius-sm); }
+  .btn-split { font-size: 12px; padding: 4px 10px; border-radius: var(--radius-sm);
+    border: 1px solid var(--border); background: #FFF6F2; color: #C2694A; cursor: pointer; }
+  .btn-split:hover { filter: brightness(0.97); }
+  .btn-split-auto { font-size: 12px; padding: 4px 12px; border-radius: var(--radius-sm);
+    border: 1px solid #E0A88E; background: #FFEDE3; color: #C2694A; font-weight: 600; cursor: pointer; }
+  .btn-split-auto:hover { filter: brightness(0.97); }
+  .split-manual { display: inline-flex; align-items: center; gap: 3px; font-size: 11px; color: var(--text-muted); }
 </style>
 </head>
 <body>
@@ -526,6 +545,7 @@ let currentPlayingFile = null;
 let showingFinal = false;
 let finalExists = false;  // final.mp4が存在するか（無ければ▶再生は素材プレビューにフォールバック）
 let voiceoverEnd = 0;
+let copyMode = false;   // リール間コピー: カード秒数を数字で直接編集＋お手本プレビューを出す
 
 let soundFiles = [];
 
@@ -538,6 +558,7 @@ async function loadAll() {
   soundFiles = soundsRes;
   cards = timeline.cards;
   finalExists = !!timeline.final_exists;
+  copyMode = !!timeline.copy_mode;
   voiceoverEnd = timeline.voiceover_duration ?? (cards[cards.length - 1]?.end ?? 0);
   // 後方互換: 旧形式 card.clip(単一) を card.clips(リスト) に正規化
   // さらにカードレベルの sfx/sfx_volume をクリップレベルに移行
@@ -672,7 +693,22 @@ function renderCards() {
         <span class="card-num"
               onclick="seekFinal(${i})" title="完成版プレビューをこのカードの位置から再生">カード${i + 1}</span>
         <span>${card.start.toFixed(2)}s 〜 ${card.end.toFixed(2)}s</span>
-        <span>${(card.end - card.start).toFixed(2)}s</span>
+        ${copyMode
+          ? `<span class="dur-edit">尺 <input type="number" class="dur-input" min="0.2" step="0.1"
+                 value="${(card.end - card.start).toFixed(2)}"
+                 onchange="setCardDuration(${i}, this.value)"
+                 title="このカードの秒数。変更すると以降のカードも自動でずれます">秒</span>
+             ${card.ref_dur ? `<button class="btn-ref" onclick="playReference(${i})"
+                 title="参考リールのこのカットを再生（お手本）">▶ お手本</button>` : ''}
+             <span class="split-ctrl">
+               <button class="btn-split-auto" onclick="autoSplitCard(${i})"
+                 title="このカードの中に実際に何カットあるかを自動で判定して分割します（枚数を数えなくてOK）">✂️ 自動分割</button>
+               <span class="split-manual" title="自動でうまく分かれないときは、枚数を指定して分割できます">手動
+                 <input type="number" class="split-n" min="2" max="8" value="2">
+                 <button class="btn-split" onclick="splitCard(${i}, this.previousElementSibling.value)">分割</button>
+               </span>
+             </span>`
+          : `<span>${(card.end - card.start).toFixed(2)}s</span>`}
         <span>${card.text.length}字</span>
         <div class="header-controls">
           ${zoomRowHtml(card, i)}
@@ -680,6 +716,7 @@ function renderCards() {
       </div>
       <div class="card-text-area">
         <textarea class="card-text card-text-full" rows="1" oninput="onTextInput(${i}, this)" onchange="autosave()"
+          placeholder="${copyMode && card.ref_text ? attrEsc('例）' + card.ref_text) : ''}"
           title="長い場合は自動で2行に折り返されます。Enterで改行位置を指定することもできます">${card.text}</textarea>
         <div class="card-side-controls">
           <div class="ctrl-row">
@@ -951,6 +988,7 @@ function hideLoading() {
 function playSegment(file, inPoint, duration) {
   const video = document.getElementById('previewVideo');
   playUntil = null;
+  video.loop = false;    // お手本ループ(<video loop>)を必ず解除してから素材を再生する
   hideOverlayPreview();  // 素材再生に切り替わるので前カードのオーバーレイ表示は消す
 
   const applyRange = () => {
@@ -1109,6 +1147,11 @@ function applyClipToSub(card, k, material, subDuration) {
 }
 
 function round3(x) { return Math.round(x * 1000) / 1000; }
+// HTML属性に文字列を安全に入れる（テロップ見本のplaceholder用）
+function attrEsc(s) {
+  return String(s || '').replace(/&/g, '&amp;').replace(/"/g, '&quot;')
+    .replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/[\r\n]+/g, ' ');
+}
 
 // ── 素材の差し替え（サブクリップ単位）──────────────
 function swapSub(i, k) {
@@ -1155,6 +1198,140 @@ function emptyClipHtml(i) {
         <select onchange="assignFirstClip(${i}, this.value)">${opts}</select>
       </div>
     </div>`;
+}
+
+// ── リール間コピー: カード秒数を数字で変更する ──────────
+// 指定カードの尺をdに変え、以降のカードは自分の尺を保ったまま連続するようずらす。
+// カード内のクリップ（割当て済み素材）も新しい尺に合わせて伸縮する。
+function setCardDuration(i, val) {
+  const d = round3(Math.max(0.2, Number(val) || 0));
+  const card = cards[i];
+  const clips = card.clips || [];
+  if (clips.length === 1) {
+    clips[0].duration = d;
+  } else if (clips.length > 1) {
+    const cur = clips.reduce((s, c) => s + (c.duration || 0), 0) || d;
+    const factor = d / cur;
+    clips.forEach(c => { c.duration = round3((c.duration || 0) * factor); });
+    // 丸め誤差は最後のカットで吸収して合計をdに合わせる
+    const drift = round3(d - clips.reduce((s, c) => s + c.duration, 0));
+    clips[clips.length - 1].duration = round3(clips[clips.length - 1].duration + drift);
+  }
+  // 各カードの尺を保持したまま、iだけdに差し替えて全カードを連続配置し直す
+  const durs = cards.map(c => round3(c.end - c.start));
+  durs[i] = d;
+  let t = 0;
+  cards.forEach((c, idx) => { c.start = round3(t); c.end = round3(t + durs[idx]); t = c.end; });
+  renderCards();
+  updateTotalDuration();
+  autosave();
+}
+
+// ── リール間コピー: 1枚のカードをn枚に分割する ──────────
+// 同構図のジャンプカット（画がほぼ変わらない切り替え）はシーン検出で拾えず、
+// 実際は複数カットなのに1カードになることがある。お手本を見て気づいたら、
+// このカードをn等分に割る。合計の尺は変えない（以降のカードはずれない）。
+// お手本の参照区間(ref_in/ref_dur)も等分して、各カードが自分の担当カットを再生できる。
+// 自動分割（おすすめ）: このカードの参考区間の中に実際に何カットあるかを
+// サーバーが検出し、その数だけ・元リールの不均等な尺で割る。ユーザーは枚数を
+// 当てる必要がない（「何分割か分からない」問題への回答）。
+async function autoSplitCard(i) {
+  const card = cards[i];
+  const refIn0 = card.ref_in || 0;
+  const refDur = card.ref_dur != null ? card.ref_dur : round3(card.end - card.start);
+  setStatus('参考リールのカット数を自動で調べています…');
+  let segs = null;
+  try {
+    const res = await fetch(`/api/detect_splits?start=${refIn0}&dur=${refDur}&n=auto`)
+      .then(r => r.json());
+    if (res.ok && Array.isArray(res.segments)) segs = res.segments;
+  } catch (e) { /* 下でフォールバック案内 */ }
+  if (!segs || segs.length < 2) {
+    setStatus(`カード${i + 1}の中に追加のカットは見つかりませんでした（このカードは1カットのようです。分けたいときは枚数を指定して「分割」してください）`);
+    return;
+  }
+  applySplit(i, segs, `カード${i + 1}を自動で${segs.length}カットに分割しました`);
+}
+
+// 手動分割: 枚数nを指定。参考区間をその数のカット境界で不均等に割る（失敗時は均等割り）。
+async function splitCard(i, n) {
+  n = Math.max(2, Math.min(8, Math.round(Number(n) || 2)));
+  const card = cards[i];
+  const refIn0 = card.ref_in || 0;
+  const refDur = card.ref_dur != null ? card.ref_dur : round3(card.end - card.start);
+  let refSegs = null;
+  setStatus('参考リールのカット位置を解析中…');
+  try {
+    const res = await fetch(`/api/detect_splits?start=${refIn0}&dur=${refDur}&n=${n}`)
+      .then(r => r.json());
+    if (res.ok && Array.isArray(res.segments) && res.segments.length === n) refSegs = res.segments;
+  } catch (e) { /* フォールバックへ */ }
+  if (!refSegs) {
+    const rp = round3(refDur / n);
+    refSegs = Array.from({ length: n }, (_, k) => ({
+      ref_in: round3(refIn0 + rp * k),
+      ref_dur: k === n - 1 ? round3(refDur - rp * (n - 1)) : rp,
+    }));
+  }
+  applySplit(i, refSegs, `カード${i + 1}を${n}枚に分割しました`);
+}
+
+// 分割の適用（共通）: refSegs（{ref_in,ref_dur}の配列）に従ってカードiを置き換える。
+// タイムライン尺は参考区間の比率でカードの尺に配分（合計=元のカード尺で不変・後続はずれない）。
+// テロップ見本・スタイルは引き継ぎ、各カードは自分の担当カットをお手本再生できる。
+function applySplit(i, refSegs, statusMsg) {
+  const card = cards[i];
+  const span = round3(card.end - card.start);
+  const n = refSegs.length;
+  const refTotal = refSegs.reduce((s, x) => s + x.ref_dur, 0) || span;
+  const pieces = refSegs.map(sg => round3(span * (sg.ref_dur / refTotal)));
+  pieces[n - 1] = round3(span - pieces.slice(0, n - 1).reduce((s, x) => s + x, 0));  // 合計=span
+
+  const STYLE_KEYS = ['title', 'title_typewriter', 'telop_color', 'telop_fontsize',
+                      'telop_font', 'telop_box', 'telop_y'];
+  const newCards = refSegs.map((sg, k) => {
+    const c = {
+      id: 0, text: k === 0 ? card.text : '', char_count: k === 0 ? (card.text || '').length : 0,
+      start: 0, end: 0, clips: [], tag_filter: card.tag_filter || 'either',
+      ref_in: sg.ref_in, ref_dur: sg.ref_dur,
+      // 1つのテロップが複数カットにまたがるので、分割した全カードに同じ見本を引き継ぐ
+      ref_text: card.ref_text || '',
+    };
+    if (k === 0) STYLE_KEYS.forEach(key => { if (card[key] !== undefined) c[key] = card[key]; });
+    return c;
+  });
+
+  const durs = cards.map(c => round3(c.end - c.start));
+  durs.splice(i, 1, ...pieces);
+  cards.splice(i, 1, ...newCards);
+  cards.forEach((c, idx) => { c.id = idx + 1; });
+  let t = 0;
+  cards.forEach((c, idx) => { c.start = round3(t); c.end = round3(t + durs[idx]); t = c.end; });
+  renderCards();
+  updateTotalDuration();
+  const detail = pieces.map(p => p.toFixed(2)).join(' / ');
+  setStatus(`${statusMsg}（${detail}秒・参考リールのカット位置どおり／合計の尺は変わりません）`);
+  autosave();
+}
+
+// ── リール間コピー: 参考リールの該当カットを再生（お手本）──
+// お手本プレビュー: このカードのカットだけを再生する。
+// サーバーが参考リールから該当区間だけを切り出した動画を配信し、<video loop>で
+// ネイティブにループする。JSタイマーで止める方式（rAF/timeupdate）はタブが非表示だと
+// 効かず次シーンにはみ出すため使わない。この方式なら構造上、絶対に次カットは映らない。
+function playReference(i) {
+  const card = cards[i];
+  if (card.ref_dur == null) return;
+  const video = document.getElementById('previewVideo');
+  playUntil = null;
+  hideOverlayPreview();
+  showingFinal = false;
+  currentPlayingFile = '__reference__' + i;  // 素材再生に切り替わったら必ず読み直す
+  video.loop = true;
+  video.src = `/api/refclip?in=${(card.ref_in || 0).toFixed(3)}&dur=${card.ref_dur.toFixed(3)}`;
+  setStatus(`お手本: このカードのカットだけを繰り返し再生中（${card.ref_dur.toFixed(2)}秒）`);
+  scheduleLoading();
+  video.play().catch(() => {});
 }
 
 // 未割当てカードに最初の素材を割り当てる
@@ -1287,9 +1464,27 @@ function undoDeleteCard() {
 function deleteCard(i) {
   lastDeleted = { card: JSON.parse(JSON.stringify(cards[i])), index: i };
   const wasLast = (i === cards.length - 1);
+  const delDur = round3(cards[i].end - cards[i].start);
   cards.splice(i, 1);
+
+  // リール間コピー: 合計尺＝参考リールとの同期が命。単に削除すると recalcCardTimes が
+  // 削除カードの尺だけ全体を縮め、以降のカードが前へずれて「後半がごっそり消える」。
+  // そこで削除カードの尺を隣（原則ひとつ前、無ければ次）のカードに吸収させ、
+  // 合計尺を保つ＝分割のやり直しで後続がずれないようにする（バグ修正）。
+  if (copyMode && cards.length > 0 && delDur > 0) {
+    const nb = i > 0 ? i - 1 : 0;   // ひとつ前のカード（先頭を消したら新しい先頭）
+    const neighbor = cards[nb];
+    neighbor.end = round3(neighbor.end + delDur);        // recalcCardTimes が dur=end-start で拾う
+    if (neighbor.ref_dur != null) neighbor.ref_dur = round3(neighbor.ref_dur + delDur);
+    if (neighbor.clips && neighbor.clips.length) {       // 割当て済みならクリップ尺も伸ばす
+      const per = round3(delDur / neighbor.clips.length);
+      neighbor.clips.forEach(cl => { cl.duration = round3((cl.duration || 0) + per); });
+    }
+  }
+
   // 末尾カードを削除した場合、新しい末尾カードをボイスオーバー終端まで延長
-  if (wasLast && cards.length > 0 && voiceoverEnd > 0) {
+  // （アフレコ編集フロー用。copyModeは上で尺を保持済みなのでここは通常スキップ）
+  if (!copyMode && wasLast && cards.length > 0 && voiceoverEnd > 0) {
     const last = cards[cards.length - 1];
     const ext = voiceoverEnd - last.end;
     if (ext > 0.01) {
@@ -1352,9 +1547,9 @@ async function _autoRender() {
 
     if (data.ok) {
       finalExists = true;
-      // 更新に成功したので、古い「完成版を読み込めません」等の警告があれば消す
-      // （成功メッセージと矛盾する警告が重なって表示されるのを防ぐ）
-      setStatus('');
+      // 更新に成功。リール間コピーでは、まだ素材が入っていないカードは参考リールで
+      // 仮表示している旨を青字で案内する（未割当てでも詰まらせない）。通常フローでは空に。
+      copyPlaceholderNotice();
       setRenderStatus('✅ 更新完了', '#f5a623');
       setTimeout(() => setRenderStatus(''), 5000);
       // 更新完了後は完成版をプレビューに読み込む。
@@ -1409,7 +1604,25 @@ function clearDirty() {}
 
 // ── 保存・書き出し ──────────────────────────────
 function setStatus(msg) {
-  document.getElementById('status').textContent = msg;
+  const el = document.getElementById('status');
+  el.style.color = '';   // 既定色に戻す（copyPlaceholderNoticeが着けた色を残さない）
+  el.textContent = msg;
+}
+
+// リール間コピー: 完成版を作ったあと、まだ素材が入っていない（参考リールの映像で
+// 仮表示中の）カードを、詰まらせない案内として青字で伝える。全部埋まったら緑字。
+function copyPlaceholderNotice() {
+  const el = document.getElementById('status');
+  if (!copyMode) { setStatus(''); return; }
+  const nums = cards.map((c, i) => (!c.clips || c.clips.length === 0) ? (i + 1) : null)
+                    .filter(x => x !== null);
+  if (!nums.length) {
+    el.style.color = '#2E7D32';
+    el.textContent = '✅ 全カードに素材が入りました。完成版を確認できます';
+  } else {
+    el.style.color = '#3A6FB0';
+    el.textContent = `▶ プレビューできます（カード ${nums.join('、')} はまだ参考リールの映像で仮表示中）。この順番で自分の素材を割り当てていってください`;
+  }
 }
 
 // ── テロップ色の選択 ──────────────────────────────
@@ -1712,6 +1925,7 @@ function showFinal() {
     return;
   }
   const video = document.getElementById('previewVideo');
+  video.loop = false;    // お手本ループを解除
   currentPlayingFile = null;
   showingFinal = true;
   playUntil = null;
@@ -1759,6 +1973,7 @@ function seekFinal(i) {
     return;
   }
   const video = document.getElementById('previewVideo');
+  video.loop = false;    // お手本ループを解除
   const startAt = cards[i].start;
   playUntil = null;
 
@@ -1787,6 +2002,7 @@ function playCardFinal(i, k = null) {
     return;
   }
   const video = document.getElementById('previewVideo');
+  video.loop = false;    // お手本ループを解除
   let startAt = cards[i].start;
   let endAt = cards[i].end;
   if (k != null) {
